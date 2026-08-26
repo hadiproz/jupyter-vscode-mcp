@@ -1,0 +1,13 @@
+.vscode/**
+.vscode-test/**
+src/**
+test/**
+out-test/**
+node_modules/**
+tsconfig.json
+.eslintrc.js
+*.vsix
+package-lock.json
+
+# Workspace artifacts generated at runtime
+.jupyter-mcp/**

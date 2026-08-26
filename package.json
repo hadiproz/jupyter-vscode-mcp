@@ -1,0 +1,105 @@
+{
+  "name": "jupyter-vscode-mcp",
+  "displayName": "Jupyter VS Code MCP",
+  "description": "HTTP MCP server for Jupyter Notebooks in VS Code — portable URL config for Claude Code, Cursor, Windsurf, OpenCode, Kilo, Cline, Copilot and any MCP-compatible AI coding agent",
+  "version": "1.0.0",
+  "icon": "resources/icon.png",
+  "publisher": "hadiproz",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.120.0",
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hadiproz/jupyter-vscode-mcp"
+  },
+  "categories": [
+    "Machine Learning",
+    "Data Science",
+    "Notebooks"
+  ],
+  "keywords": [
+    "jupyter",
+    "notebook",
+    "mcp",
+    "model context protocol",
+    "ai",
+    "claude",
+    "cursor",
+    "windsurf",
+    "opencode",
+    "kilo",
+    "cline",
+    "copilot",
+    "coding agent"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onNotebook:jupyter-notebook"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jupyter-vscode-mcp.startMcp",
+        "title": "Start MCP Server",
+        "category": "Jupyter VS Code MCP"
+      },
+      {
+        "command": "jupyter-vscode-mcp.stopMcp",
+        "title": "Stop MCP Server",
+        "category": "Jupyter VS Code MCP"
+      },
+      {
+        "command": "jupyter-vscode-mcp.toggleMcp",
+        "title": "Toggle MCP Server",
+        "category": "Jupyter VS Code MCP"
+      },
+      {
+        "command": "jupyter-vscode-mcp.showConfig",
+        "title": "Show MCP Configuration",
+        "category": "Jupyter VS Code MCP"
+      }
+    ],
+    "configuration": {
+      "title": "Jupyter VS Code MCP",
+      "properties": {
+        "jupyter-vscode-mcp.mcpPort": {
+          "type": "number",
+          "default": 9123,
+          "description": "Port for the local MCP HTTP server"
+        },
+        "jupyter-vscode-mcp.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the MCP server when VS Code starts"
+        }
+      }
+    }
+  },
+  "extensionDependencies": [
+    "ms-toolsai.jupyter"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "build": "npm run esbuild-base",
+    "smoke": "node test/local-smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/vscode": "1.115",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.9.1",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^8.68.0"
+  }
+}
