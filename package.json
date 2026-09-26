@@ -2,7 +2,7 @@
   "name": "jupyter-vscode-mcp",
   "displayName": "Jupyter VS Code MCP",
   "description": "HTTP MCP server for Jupyter Notebooks in VS Code — portable URL config for Claude Code, Cursor, Windsurf, OpenCode, Kilo, Cline, Copilot and any MCP-compatible AI coding agent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "icon": "resources/icon.png",
   "publisher": "hadiproz",
   "license": "MIT",
@@ -91,9 +91,11 @@
     "smoke": "node test/local-smoke.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
+    "@modelcontextprotocol/node": "2.1.0",
+    "@modelcontextprotocol/server": "2.1.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.1.0",
     "@types/node": "^24.13.3",
     "@types/vscode": "1.120.0",
     "@vscode/vsce": "^3.9.2",

@@ -1,15 +1,7 @@
 import * as http from 'http';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { createMcpHandler, Server, CallToolResult, McpHttpHandler, Tool as McpTool } from '@modelcontextprotocol/server';
+import { toNodeHandler, localhostHostValidation, localhostOriginValidation } from '@modelcontextprotocol/node';
 import { JupyterApi } from './jupyterApi';
-import { randomUUID } from 'crypto';
-
-interface Tool {
-  name: string;
-  description: string;
-  inputSchema: object;
-}
 
 const NOTEBOOK_URI = {
   uri: { type: 'string', description: 'Optional URI/path of the notebook. Defaults to the active one.' },
@@ -19,7 +11,7 @@ const CELL_REF = {
   index: { type: 'number', description: 'Zero-based cell index (fallback).' },
 };
 
-const TOOLS: Tool[] = [
+const TOOLS: McpTool[] = [
   {
     name: 'jupyter_list_open_notebooks',
     description: 'List all currently open Jupyter notebooks in VS Code.',
@@ -176,7 +168,7 @@ const MCP_PATHS = new Set(['/', '/mcp', '/sse']);
 
 export class McpServerManager {
   private httpServer?: http.Server;
-  private transports = new Map<string, StreamableHTTPServerTransport>();
+  private handler?: McpHttpHandler;
 
   constructor(
     private jupyterApi: JupyterApi,
@@ -205,10 +197,10 @@ export class McpServerManager {
       }
     );
 
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+    server.setRequestHandler('tools/list', async () => ({ tools: TOOLS }));
 
-    server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
-      const { name, arguments: args } = request.params as { name: string; arguments?: Record<string, unknown> };
+    server.setRequestHandler('tools/call', async (request): Promise<CallToolResult> => {
+      const { name, arguments: args } = request.params;
       return this.handleToolCall(name, args);
     });
 
@@ -218,7 +210,14 @@ export class McpServerManager {
   async start(): Promise<void> {
     if (this.httpServer) return;
 
-    this.httpServer = http.createServer(async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    // One factory, one endpoint: serves modern (2026-07-28) clients per request
+    // and legacy (2025-11-25) clients statelessly through the same handler.
+    this.handler = createMcpHandler(() => this.createServer(), { legacy: 'stateless' });
+    const nodeHandler = toNodeHandler(this.handler);
+    const validateHost = localhostHostValidation();
+    const validateOrigin = localhostOriginValidation();
+
+    this.httpServer = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, mcp-protocol-version');
@@ -243,48 +242,14 @@ export class McpServerManager {
         return;
       }
 
-      try {
-        const sessionIdHeader = req.headers['mcp-session-id'];
-        const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
-
-        let transport: StreamableHTTPServerTransport;
-
-        if (sessionId) {
-          const existing = this.transports.get(sessionId);
-          if (!existing) {
-            res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null }));
-            return;
-          }
-          transport = existing;
-        } else {
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            enableJsonResponse: true,
-            onsessioninitialized: (id: string) => {
-              this.transports.set(id, transport);
-            },
-          });
-
-          const server = this.createServer();
-          await server.connect(transport);
-
-          transport.onclose = () => {
-            const id = transport.sessionId;
-            if (id) this.transports.delete(id);
-          };
-        }
-
-        await transport.handleRequest(req, res);
-
-        const generatedSessionId = transport.sessionId;
-        if (generatedSessionId && !this.transports.has(generatedSessionId)) {
-          this.transports.set(generatedSessionId, transport);
-        }
-      } catch (error) {
-        res.writeHead(500);
-        res.end(error instanceof Error ? error.message : String(error));
+      // DNS-rebinding + cross-origin hardening: only loopback hosts/origins may
+      // reach the MCP endpoint. Requests without an Origin (curl, CLI agents)
+      // pass — Origin is the browser-only signal.
+      if (!validateHost(req, res) || !validateOrigin(req, res)) {
+        return;
       }
+
+      void nodeHandler(req, res);
     });
 
     return new Promise<void>((resolve, reject) => {
@@ -294,10 +259,10 @@ export class McpServerManager {
   }
 
   async stop(): Promise<void> {
-    for (const transport of this.transports.values()) {
-      await transport.close();
+    if (this.handler) {
+      await this.handler.close();
+      this.handler = undefined;
     }
-    this.transports.clear();
 
     if (this.httpServer) {
       await new Promise<void>((resolve) => {

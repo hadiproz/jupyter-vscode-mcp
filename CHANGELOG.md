@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.0 — MCP SDK v2 (spec 2026-07-28)
+
+Migrated the embedded MCP server from the v1 SDK (`@modelcontextprotocol/sdk`) to the **v2 package line** (`@modelcontextprotocol/server` + `@modelcontextprotocol/node`, pinned at 2.1.0) and the current protocol revision.
+
+### Changed
+
+- **Dual-era serving**: modern **2026-07-28** clients are served per request; **2025-11-25** clients keep working, statelessly, from the same endpoint (both eras verified against the official v2 client in the smoke suite).
+- **Stateless transport**: the session map is gone — no `mcp-session-id` is issued, stale/bogus session headers are ignored, `GET /mcp` returns `405` (session-scoped SSE streams removed), and every request stands alone (port-hot-restart tolerance is now structural).
+- **Response shape (legacy clients)**: single-message **SSE** (`event: message` / `data: …`) instead of always-plain JSON. Per the Streamable HTTP spec a POST client must accept both `application/json` and `text/event-stream` — JSON-only `Accept` gets `406` with an actionable error. Responses remain single-frame and curl-friendly.
+- **Security hardening**: localhost **Host/Origin validation** now fronts the MCP paths (rejects forged `Host` / non-local `Origin` with `403`, DNS-rebinding protection). Requests without an `Origin` header (curl, CLI agents) are unaffected.
+
+### Added
+
+- `docs/research/` — deep research on the v2 migration path plus a reproducible dual-era spike (`docs/research/spike/`).
+
+### Requirements
+
+- Unchanged: VS Code ^1.120.0, Node >= 20 (v2 SDK floor is Node 20).
+
 ## 1.0.0 — Initial public release
 
 First public release of **Jupyter VS Code MCP** — an HTTP MCP server that exposes Jupyter notebook operations in VS Code to any MCP-compatible AI agent.

@@ -27,9 +27,9 @@ Point any MCP client at the URL, and the agent can explore, edit, run, and debug
 - `jupyter_select_kernel` opens VS Code's native kernel picker when no kernel is active.
 
 ### Network-only MCP transport
-- Streamable HTTP (MCP spec 2025-11-25) with plain-JSON responses — a minimal client works with nothing but `curl`.
-- Endpoints: `/mcp` (plus legacy `/sse`), `GET /health` for liveness + version probing.
-- Multiple concurrent agent sessions supported; sessions survive hot port changes.
+- Streamable HTTP (MCP spec **2026-07-28** for modern clients; **2025-11-25** clients are served statelessly from the same endpoint) — single-message responses, so a minimal client works with nothing but `curl` (`Accept: application/json, text/event-stream`; one `event: message` frame per response).
+- Endpoints: `POST /mcp` (plus legacy `/sse`), `GET /health` for liveness + version probing. Localhost Host/Origin validation guards the MCP paths (DNS-rebinding hardening).
+- Stateless serving: no session ids — unlimited concurrent agents, every request standalone, stale session headers ignored (`GET /mcp` returns `405` by design).
 
 ### Honest reporting
 Errors carry context and next-step hints: missing kernel → boot guidance, stale ID → refresh via summary, failed pip install → real pip error tail, busy kernel → explicit deferral note instead of silently empty results.
@@ -145,7 +145,7 @@ npx @vscode/vsce package
 
 ## References
 
-- [Model Context Protocol](https://modelcontextprotocol.io) — Streamable HTTP transport, spec 2025-11-25
+- [Model Context Protocol](https://modelcontextprotocol.io) — Streamable HTTP transport, spec 2026-07-28 (2025-11-25 clients served statelessly)
 - [microsoft/vscode-copilot-chat](https://github.com/microsoft/vscode-copilot-chat) (MIT) — variable summarization, truncation budgets, and symbol-filtering patterns
 - [SMARK OpenCode IDE Bridge](https://github.com/SMARK2022/opencode/tree/dev-smark/sdks/vscode) — kernel pre-checks via Jupyter public API, interrupt/restart command fallbacks, event-based completion tracking
 - [kriss-spy/opencode-jupyter](https://github.com/kriss-spy/opencode-jupyter) — original HTTP bridge concept
