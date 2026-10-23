@@ -1,0 +1,40 @@
+name: Release
+
+# Builds the .vsix from source and attaches it to a GitHub Release.
+# Trigger: push a version tag (e.g. v1.0.0), or run manually from the
+# Actions tab and supply the existing tag name (e.g. v1.0.0).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing tag to create/update the release for"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Package extension (.vsix)
+        run: npx @vscode/vsce package
+
+      - name: Create GitHub Release with .vsix attached
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          files: "*.vsix"
+          generate_release_notes: true
