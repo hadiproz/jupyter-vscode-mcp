@@ -1,19 +1,84 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { compactCell, stableCellId, hasPersistentCellId, freshPersistentCellId, normalizeCellId, extensionForMime, isTextLikeMime, runtimeLabel } from './format';
+import { createHash, randomUUID } from 'node:crypto';
+import { compactCell, executionText, outputMimes, stableCellId, hasPersistentCellId, freshPersistentCellId, normalizeCellId, extensionForMime, isTextLikeMime, runtimeLabel } from './format';
 import { toPosixPath, isRecord } from './util';
 
 interface ActiveExec {
-  cellUri: string;
-  state: 'executing';
+  startedAt: number;
+  priorFingerprint?: string;
 }
 
 interface CellCompletion {
   id: string;
   i: number;
   success: boolean;
+  exec: string;
+  outs: string[];
   at: number;
+  elapsedMs: number;
+}
+
+interface RuntimeInfo {
+  version: string;
+  platform: string;
+  machine: string;
+}
+
+interface RuntimeEntry {
+  kernel: JupyterKernelLike;
+  probe?: Promise<RuntimeInfo | undefined>;
+  subscription?: vscode.Disposable;
+}
+
+interface RunOptions {
+  waitTimeoutSec?: number;
+  includeOutputs?: boolean;
+  signal?: AbortSignal;
+  onProgress?: (done: number, total: number, message: string) => void;
+}
+
+interface CellArtifact {
+  output: number;
+  item: number;
+  mime: string;
+  bytes: number;
+  artifactPath: string;
+  preview?: string;
+  text?: string;
+}
+
+type RunCell = ReturnType<typeof compactCell> & {
+  elapsedMs?: number;
+  outputs?: CellArtifact[];
+  artifactsRoot?: string;
+  outputError?: string;
+};
+
+interface RunTarget {
+  cell: vscode.NotebookCell;
+  skipReason?: string;
+}
+
+function runTarget(cell: vscode.NotebookCell): RunTarget {
+  if (cell.kind !== vscode.NotebookCellKind.Code) return { cell, skipReason: 'not code' };
+  // Jupyter ends raw/empty cells without a successful or failed summary.
+  if (cell.document.languageId === 'raw') return { cell, skipReason: 'raw cell' };
+  if (cell.document.getText().trim() === '') return { cell, skipReason: 'empty cell' };
+  return { cell };
+}
+
+function cellRef(cell: vscode.NotebookCell) {
+  return { i: cell.index, id: stableCellId(cell) };
+}
+
+function executionElapsed(summary: vscode.NotebookCellExecutionSummary, startedAt: number, endedAt: number): number {
+  return Math.max(0, summary.timing ? summary.timing.endTime - summary.timing.startTime : endedAt - startedAt);
+}
+
+function kernelError(status: string): Error {
+  return new Error(`Kernel status is "${status}". Wait for a restart to finish or use jupyter_restart_kernel, then retry jupyter_run_cells.`);
 }
 
 interface KernelOutputItemLike {
@@ -24,6 +89,7 @@ interface KernelOutputItemLike {
 export interface JupyterKernelLike {
   language?: string;
   status?: string;
+  onDidChangeStatus?: vscode.Event<string>;
   executeCode?(code: string, token: vscode.CancellationToken): AsyncIterable<{ items: KernelOutputItemLike[] }>;
 }
 
@@ -34,6 +100,9 @@ type JupyterExtensionApi = {
 };
 
 const KERNEL_BUSY_STATES = new Set(['busy', 'starting', 'restarting', 'autorestarting']);
+const KERNEL_UNAVAILABLE_STATES = new Set(['dead', 'terminating', 'restarting', 'autorestarting']);
+const WAIT_EXPIRED = Symbol('cell execution wait expired');
+const PROGRESS_INTERVAL_MS = 5000;
 
 function hasKernelspecMetadata(notebook: vscode.NotebookDocument): boolean {
   const meta = notebook['metadata'] as Record<string, unknown>;
@@ -150,58 +219,91 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export class JupyterApi {
   private activeExecs = new Map<string, Map<string, ActiveExec>>();
   private completions = new Map<string, CellCompletion[]>();
+  private runtimes = new Map<string, RuntimeEntry>();
+  private batches = new Map<string, AbortController>();
 
   constructor(private context: vscode.ExtensionContext) {
     context.subscriptions.push(
-      vscode.workspace.onDidChangeNotebookDocument((e) => this.onNotebookChange(e))
+      vscode.workspace.onDidChangeNotebookDocument((e) => this.onNotebookChange(e)),
+      vscode.workspace.onDidCloseNotebookDocument((notebook) => {
+        this.clearNotebookState(notebook.uri.toString(), 'Notebook was closed during cell execution.');
+      }),
     );
   }
 
-  private onNotebookChange(e: vscode.NotebookDocumentChangeEvent) {
-    if (e.cellChanges.length === 0) return;
-    const nbKey = e.notebook.uri.fsPath;
-    let m = this.activeExecs.get(nbKey);
-    if (!m) {
-      m = new Map();
-      this.activeExecs.set(nbKey, m);
+  clearAllState() {
+    for (const batch of this.batches.values()) batch.abort(new Error('The Jupyter MCP window no longer owns this execution.'));
+    this.batches.clear();
+    this.activeExecs.clear();
+    this.completions.clear();
+    for (const runtime of this.runtimes.values()) runtime.subscription?.dispose();
+    this.runtimes.clear();
+  }
+
+  clearStaleWorkspaceState() {
+    const retained = new Set(vscode.workspace.notebookDocuments
+      .filter((notebook) => vscode.workspace.getWorkspaceFolder(notebook.uri))
+      .map((notebook) => notebook.uri.toString()));
+    const tracked = new Set([...this.activeExecs.keys(), ...this.completions.keys(), ...this.runtimes.keys(), ...this.batches.keys()]);
+    for (const key of tracked) {
+      if (!retained.has(key)) this.clearNotebookState(key, 'Notebook is no longer in the workspace.');
     }
+  }
+
+  private clearNotebookState(key: string, reason: string) {
+    this.batches.get(key)?.abort(new Error(reason));
+    this.batches.delete(key);
+    this.activeExecs.delete(key);
+    this.completions.delete(key);
+    this.runtimes.get(key)?.subscription?.dispose();
+    this.runtimes.delete(key);
+  }
+
+  private trackExec(key: string, cellUri: string, active: ActiveExec) {
+    const running = this.activeExecs.get(key) ?? new Map<string, ActiveExec>();
+    running.set(cellUri, active);
+    this.activeExecs.set(key, running);
+  }
+
+  private onNotebookChange(e: vscode.NotebookDocumentChangeEvent) {
+    if (e.notebook.isClosed) return;
+    const key = e.notebook.uri.toString();
     for (const change of e.cellChanges) {
       const summary = change.executionSummary;
       if (!summary) continue;
       const cellKey = change.cell.document.uri.toString();
+      const active = this.activeExecs.get(key)?.get(cellKey);
+      if (active?.priorFingerprint === JSON.stringify(summary)) continue;
       if (typeof summary.success === 'boolean') {
-        m.delete(cellKey);
-        const arr = this.completions.get(nbKey) ?? [];
-        arr.push({
-          id: stableCellId(change.cell),
-          i: change.cell.index,
+        this.activeExecs.get(key)?.delete(cellKey);
+        const recent = this.completions.get(key) ?? [];
+        const at = Date.now();
+        recent.push({
+          ...cellRef(change.cell),
           success: summary.success,
-          at: Date.now(),
+          exec: executionText(change.cell, summary),
+          outs: outputMimes(change.cell),
+          at,
+          elapsedMs: executionElapsed(summary, active?.startedAt ?? at, at),
         });
-        if (arr.length > 50) arr.splice(0, arr.length - 50);
-        this.completions.set(nbKey, arr);
-      } else {
-        m.set(cellKey, { cellUri: cellKey, state: 'executing' });
+        if (recent.length > 50) recent.shift();
+        this.completions.set(key, recent);
+      } else if (!active) {
+        this.trackExec(key, cellKey, { startedAt: summary.timing?.startTime ?? Date.now() });
       }
     }
   }
 
-  private running(notebook: vscode.NotebookDocument): Array<{ id: string; index: number; state: string }> {
-    const m = this.activeExecs.get(notebook.uri.fsPath);
-    if (!m || m.size === 0) return [];
+  private running(notebook: vscode.NotebookDocument) {
+    const tracked = this.activeExecs.get(notebook.uri.toString());
+    if (!tracked?.size) return [];
     const byUri = new Map(notebook.getCells().map((c) => [c.document.uri.toString(), c] as const));
-    const result: Array<{ id: string; index: number; state: string }> = [];
-    for (const [cellUri, info] of m) {
+    const now = Date.now();
+    const result = [];
+    for (const [cellUri, info] of tracked) {
       const cell = byUri.get(cellUri);
-      if (!cell) {
-        m.delete(cellUri);
-        continue;
-      }
-      if (typeof cell.executionSummary?.success === 'boolean') {
-        m.delete(cellUri);
-        continue;
-      }
-      result.push({ id: stableCellId(cell), index: cell.index, state: info.state });
+      if (cell) result.push({ id: stableCellId(cell), index: cell.index, state: 'executing', elapsedMs: now - info.startedAt });
+      else tracked.delete(cellUri);
     }
     return result.sort((a, b) => a.index - b.index);
   }
@@ -326,57 +428,269 @@ export class JupyterApi {
     };
   }
 
-  async executeCells(uri: string | undefined, range: { start: number; end: number } | { ids: string[] }) {
+  async executeCells(
+    uri: string | undefined,
+    range: { start: number; end: number } | { ids: string[] },
+    { waitTimeoutSec = 30, includeOutputs = true, onProgress, signal }: RunOptions = {},
+  ) {
+    signal?.throwIfAborted();
     const notebook = this.resolveNotebook(uri);
-    const targets: vscode.NotebookCell[] = [];
+    const key = notebook.uri.toString();
+    const cells = 'ids' in range
+      ? range.ids.map((id) => this.resolveCell(notebook, undefined, id))
+      : notebook.getCells().slice(Math.max(0, range.start), Math.max(0, range.end));
+    const targets = cells.map(runTarget);
+    const total = targets.filter(({ skipReason }) => skipReason === undefined).length;
+    const startedAt = Date.now();
 
-    if ('start' in range) {
-      const start = Math.max(0, range.start);
-      const end = Math.min(range.end, notebook.cellCount);
-      for (let i = start; i < end; i++) targets.push(notebook.cellAt(i));
-    } else {
-      for (const id of range.ids) targets.push(this.resolveCell(notebook, undefined, id));
+    if (this.batches.has(key)) {
+      throw new Error('This notebook already has an MCP batch running. Use jupyter_get_status to check its progress.');
     }
-
-    const skipped = targets.filter((c) => c.kind !== vscode.NotebookCellKind.Code).map(compactCell);
-    const codeCells = targets.filter((c) => c.kind === vscode.NotebookCellKind.Code);
-
-    if (codeCells.length === 0) {
-      return { started: [], skipped, note: 'No code cells selected — nothing to execute.' };
-    }
-
-    const kernel = await this.getKernelInfo(notebook.uri);
-    if (kernel?.status === 'dead' || kernel?.status === 'terminating') {
-      throw new Error(
-        `Kernel status is "${kernel.status}". Use jupyter_restart_kernel first, then retry jupyter_run_cells.`
-      );
-    }
-    if (!kernel) {
-      const hasSpec = hasKernelspecMetadata(notebook);
-      if (!hasSpec) {
+    const batch = new AbortController();
+    this.batches.set(key, batch);
+    const release = () => {
+      if (this.batches.get(key) === batch) this.batches.delete(key);
+    };
+    const request = signal ? AbortSignal.any([batch.signal, signal]) : batch.signal;
+    let background = false;
+    try {
+      const kernel = await this.getKernelInfo(notebook.uri);
+      request.throwIfAborted();
+      const kernelStatus = kernel?.status ?? 'unknown';
+      if (total === 0) {
         return {
-          started: [],
-          skipped,
-          ran: false,
-          hint: 'No active kernel and no kernelspec metadata. Select a kernel in the VS Code notebook toolbar first, then retry.',
+          status: 'completed', durationMs: Date.now() - startedAt, kernelStatus,
+          cells: targets.map(({ cell, skipReason }) => ({ ...compactCell(cell), exec: `skipped (${skipReason})` })),
         };
       }
+      if (KERNEL_UNAVAILABLE_STATES.has(kernelStatus)) throw kernelError(kernelStatus);
+      if (!kernel && !hasKernelspecMetadata(notebook)) {
+        throw new Error('No active kernel or kernelspec metadata. Select a kernel in the VS Code notebook toolbar, then retry.');
+      }
+      await this.ensureCommand(
+        'notebook.cell.execute',
+        'Ensure the Jupyter extension (ms-toolsai.jupyter) is installed and a kernel is selected for the notebook.',
+      );
+      request.throwIfAborted();
+      if (waitTimeoutSec === 0) {
+        // The MCP exchange ends after dispatch, but the explicitly requested
+        // background batch still observes cell outcomes and the notebook lifetime.
+        if (!this.hasNotebookEditor(notebook)) await this.showExecutionEditor(notebook, request);
+        const firstIndex = targets.findIndex(({ skipReason }) => skipReason === undefined);
+        const first = targets[firstIndex]!.cell;
+        this.assertDispatchable(first);
+        const planned = targets.map(({ cell, skipReason }, index) => ({
+          ...compactCell(cell),
+          exec: skipReason ? `skipped (${skipReason})` : index === firstIndex ? 'started' : 'pending',
+        }));
+        onProgress?.(0, total, `Starting cell ${stableCellId(first)}`);
+        request.throwIfAborted();
+        const task = this.runBatch(notebook, targets, kernel, total, 0, false, batch.signal);
+        background = true;
+        void task.catch((error) => {
+          if (!batch.signal.aborted) console.error('Jupyter MCP background execution failed:', error);
+        }).finally(release);
+        return { status: 'started', kernelStatus: kernel?.status ?? 'unknown', cells: planned };
+      }
+
+      return await this.runBatch(notebook, targets, kernel, total, waitTimeoutSec * 1000, includeOutputs, request, onProgress);
+    } finally {
+      if (!background) release();
     }
+  }
 
-    await this.ensureCommand(
-      'notebook.cell.execute',
-      'Ensure the Jupyter extension (ms-toolsai.jupyter) is installed and a kernel is selected for the notebook.'
-    );
+  private async runBatch(
+    notebook: vscode.NotebookDocument,
+    targets: RunTarget[],
+    kernel: JupyterKernelLike | undefined,
+    total: number,
+    timeoutMs: number,
+    includeOutputs: boolean,
+    request: AbortSignal,
+    onProgress?: RunOptions['onProgress'],
+  ) {
+    const startedAt = Date.now();
+    const deadline = new AbortController();
+    const timer = timeoutMs > 0 ? setTimeout(() => deadline.abort(WAIT_EXPIRED), timeoutMs) : undefined;
+    const signal = timer ? AbortSignal.any([request, deadline.signal]) : request;
+    const results: Array<RunCell | Promise<RunCell>> = [];
+    const runtime = { kernel };
+    let next = 0;
+    let current: (ReturnType<typeof cellRef> & { startedAt: number }) | undefined;
+    let failed = false;
+    let done = 0;
+    try {
+      for (const { cell, skipReason } of targets) {
+        signal.throwIfAborted();
+        if (failed || skipReason) {
+          next++;
+          results.push({ ...compactCell(cell), exec: `skipped (${failed ? 'previous cell failed' : skipReason})` });
+          continue;
+        }
 
-    for (const cell of codeCells) {
-      await vscode.commands.executeCommand('notebook.cell.execute', { start: cell.index, end: cell.index + 1 }, notebook.uri);
+        if (!this.hasNotebookEditor(notebook)) await this.showExecutionEditor(notebook, signal);
+        signal.throwIfAborted();
+        next++;
+        current = { ...cellRef(cell), startedAt: Date.now() };
+        const summary = await this.waitForCell(cell, runtime, signal, current.startedAt, onProgress && ((message) => {
+          onProgress(done, total, message);
+        }));
+        const elapsedMs = executionElapsed(summary, current.startedAt, Date.now());
+        const result: RunCell = { ...compactCell(cell), exec: executionText(cell, summary), elapsedMs };
+        failed = summary.success === false;
+        current = undefined;
+        done++;
+        results.push(includeOutputs ? this.collectCellArtifacts(notebook, cell).then(
+          ({ artifactsRoot, artifacts }) => ({ ...result, artifactsRoot, outputs: artifacts }),
+          (error: unknown) => ({ ...result, outputError: error instanceof Error ? error.message : String(error) }),
+        ) : result);
+        onProgress?.(done, total, `Cell ${result.id} ${failed ? 'failed' : 'succeeded'} (${elapsedMs} ms)`);
+      }
+    } catch (error) {
+      if (error !== WAIT_EXPIRED) throw error;
+      const now = Date.now();
+      return {
+        status: 'running', waitedMs: now - startedAt, kernelStatus: runtime.kernel?.status ?? 'unknown',
+        completedCells: await Promise.all(results),
+        runningCells: current ? [{ i: current.i, id: current.id, elapsedMs: now - current.startedAt }] : [],
+        pendingCells: targets.slice(next).filter(({ skipReason }) => skipReason === undefined).map(({ cell }) => cellRef(cell)),
+        hint: 'The dispatched cell can continue in the kernel. Use jupyter_get_status to check progress, jupyter_get_outputs to read outputs, or jupyter_interrupt_kernel to interrupt. Pending cells were not dispatched.',
+      };
+    } finally {
+      clearTimeout(timer);
     }
 
     return {
-      started: codeCells.map(compactCell),
-      skipped,
-      note: 'Execution started asynchronously (non-blocking). Call jupyter_wait_until_idle to wait for completion, then jupyter_get_outputs for results.',
+      status: 'completed', durationMs: Date.now() - startedAt, kernelStatus: runtime.kernel?.status ?? 'unknown',
+      cells: await Promise.all(results),
     };
+  }
+
+  private hasNotebookEditor(notebook: vscode.NotebookDocument): boolean {
+    return vscode.window.visibleNotebookEditors.some((editor) => editor.notebook === notebook);
+  }
+
+  private async showExecutionEditor(notebook: vscode.NotebookDocument, signal: AbortSignal): Promise<void> {
+    // VS Code falls back to the active editor if the URI has no editor widget.
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_, reject) => {
+      abort = () => reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+    try {
+      await Promise.race([
+        cancelled,
+        Promise.resolve().then(() => vscode.window.showNotebookDocument(notebook, { preserveFocus: true })),
+      ]);
+    } finally {
+      signal.removeEventListener('abort', abort);
+    }
+  }
+
+  private assertDispatchable(cell: vscode.NotebookCell) {
+    if (cell.notebook.isClosed || cell.index < 0) throw new Error('The target notebook or cell was closed or removed.');
+    if (this.activeExecs.get(cell.notebook.uri.toString())?.has(cell.document.uri.toString())) {
+      throw new Error(`Cell ${stableCellId(cell)} is already running.`);
+    }
+  }
+
+  private async waitForCell(
+    cell: vscode.NotebookCell,
+    runtime: { kernel: JupyterKernelLike | undefined },
+    signal: AbortSignal,
+    startedAt: number,
+    progress?: (message: string) => void,
+  ): Promise<vscode.NotebookCellExecutionSummary> {
+    this.assertDispatchable(cell);
+    const notebook = cell.notebook;
+    const key = notebook.uri.toString();
+    const cellUri = cell.document.uri.toString();
+
+    const priorFingerprint = JSON.stringify(cell.executionSummary) ?? 'undefined';
+    const active = { startedAt, priorFingerprint };
+    const id = stableCellId(cell);
+    let complete!: (summary: vscode.NotebookCellExecutionSummary) => void;
+    let fail!: (error: unknown) => void;
+    const completion = new Promise<vscode.NotebookCellExecutionSummary>((resolve, reject) => {
+      complete = resolve;
+      fail = reject;
+    });
+    let kernelSubscription: vscode.Disposable | undefined;
+    let checkingKernel = false;
+    let disposed = false;
+    const watchKernel = (kernel: JupyterKernelLike) => {
+      const onStatus = (status: string) => {
+        if (KERNEL_UNAVAILABLE_STATES.has(status)) {
+          this.activeExecs.delete(key);
+          fail(kernelError(status));
+        }
+      };
+      kernelSubscription = kernel.onDidChangeStatus?.(onStatus);
+      if (kernel.status) onStatus(kernel.status);
+    };
+    const changes = vscode.workspace.onDidChangeNotebookDocument((event) => {
+      if (event.notebook !== notebook) return;
+      if (cell.index < 0) {
+        this.activeExecs.get(key)?.delete(cellUri);
+        fail(new Error(`Cell ${id} was removed during execution.`));
+        return;
+      }
+      for (const change of event.cellChanges) {
+        if (change.cell.document.uri.toString() !== cellUri) continue;
+        const summary = change.executionSummary;
+        if (summary && typeof summary.success === 'boolean' && JSON.stringify(summary) !== priorFingerprint) {
+          complete(summary);
+          return;
+        }
+        // A notebook can cold-start via its kernelspec. The Jupyter API only
+        // exposes the kernel once it has started; check on the cell's first events.
+        if (!runtime.kernel && !checkingKernel) {
+          checkingKernel = true;
+          void this.getKernelInfo(notebook.uri).then((kernel) => {
+            checkingKernel = false;
+            if (disposed || !kernel) return;
+            runtime.kernel = kernel;
+            watchKernel(kernel);
+          });
+        }
+      }
+    });
+    const abort = () => fail(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    const keepalive = progress && setInterval(() => {
+      progress(`Cell ${id} is still running (${Math.floor((Date.now() - startedAt) / 1000)} s)`);
+    }, PROGRESS_INTERVAL_MS);
+
+    try {
+      if (runtime.kernel) watchKernel(runtime.kernel);
+      const command = (async () => {
+        signal.throwIfAborted();
+        if (runtime.kernel?.status && KERNEL_UNAVAILABLE_STATES.has(runtime.kernel.status)) throw kernelError(runtime.kernel.status);
+        progress?.(`Starting cell ${id}`);
+        this.trackExec(key, cellUri, active);
+        try {
+          await vscode.commands.executeCommand('notebook.cell.execute', {
+            document: notebook.uri,
+            ranges: [{ start: cell.index, end: cell.index + 1 }],
+            autoReveal: false,
+          });
+        } catch (error) {
+          if (this.activeExecs.get(key)?.get(cellUri) === active) this.activeExecs.get(key)?.delete(cellUri);
+          throw error;
+        }
+        return completion;
+      })();
+      // A fast cell can publish its result before the command settles. Either
+      // path must also release the waiter on timeout, cancellation or closure.
+      return await Promise.race([completion, command]);
+    } finally {
+      disposed = true;
+      changes.dispose();
+      kernelSubscription?.dispose();
+      signal.removeEventListener('abort', abort);
+      clearInterval(keepalive);
+    }
   }
 
   async editCell(uri: string | undefined, index: number | undefined, id: string | undefined, source: string) {
@@ -501,22 +815,33 @@ export class JupyterApi {
   async getOutputs(uri: string | undefined, index: number | undefined, id: string | undefined) {
     const notebook = this.resolveNotebook(uri);
     const cell = this.resolveCell(notebook, index, id);
+    return { cell: compactCell(cell), ...await this.collectCellArtifacts(notebook, cell) };
+  }
 
+  private async collectCellArtifacts(notebook: vscode.NotebookDocument, cell: vscode.NotebookCell) {
     const artifactsRoot = this.getArtifactsRoot(notebook);
-    if (!fs.existsSync(artifactsRoot)) {
-      fs.mkdirSync(artifactsRoot, { recursive: true });
-    }
-
+    const outputs = cell.outputs.map(({ items }) => [...items]);
+    const cellIndex = cell.index;
+    if (outputs.length > 0) await fs.promises.mkdir(artifactsRoot, { recursive: true });
     const artifacts = await Promise.all(
-      cell.outputs.flatMap((output, outputIdx) =>
-        output.items.map(async (item, itemIdx) => {
-          const filename = `${path.basename(notebook.uri.fsPath, path.extname(notebook.uri.fsPath))}-c${cell.index}-o${outputIdx}-i${itemIdx}${extensionForMime(item.mime)}`;
+      outputs.flatMap((items, outputIdx) =>
+        items.map(async (item, itemIdx) => {
+          const bytes = Buffer.from(item.data);
+          // Keep earlier results readable when the same cell runs again.
+          const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+          const name = path.basename(notebook.uri.fsPath, path.extname(notebook.uri.fsPath));
+          const filename = `${name}-c${cellIndex}-o${outputIdx}-i${itemIdx}-${digest}${extensionForMime(item.mime)}`;
           const filePath = path.join(artifactsRoot, filename);
+          const temp = path.join(artifactsRoot, `${randomUUID()}.tmp`);
+          try {
+            await fs.promises.writeFile(temp, bytes, { flag: 'wx' });
+            await fs.promises.rename(temp, filePath);
+          } catch (error) {
+            await fs.promises.rm(temp, { force: true }).catch(() => undefined);
+            throw error;
+          }
 
-          await fs.promises.writeFile(filePath, Buffer.from(item.data));
-
-          const isText = isTextLikeMime(item.mime);
-          const textValue = isText ? Buffer.from(item.data).toString('utf8') : undefined;
+          const textValue = isTextLikeMime(item.mime) ? bytes.toString('utf8') : undefined;
 
           return {
             output: outputIdx,
@@ -524,33 +849,33 @@ export class JupyterApi {
             mime: item.mime,
             bytes: item.data.byteLength,
             artifactPath: toPosixPath(filePath),
-            preview: textValue ? textValue.substring(0, 1000) : undefined,
-            text: textValue && item.data.byteLength <= 8192 ? textValue : undefined,
+            preview: textValue?.substring(0, 1000),
+            text: item.data.byteLength <= 8192 ? textValue : undefined,
           };
         })
       )
     );
 
-    return {
-      cell: compactCell(cell),
-      artifactsRoot: toPosixPath(artifactsRoot),
-      artifacts,
-    };
+    return { artifactsRoot: toPosixPath(artifactsRoot), artifacts };
   }
 
   private getArtifactsRoot(notebook: vscode.NotebookDocument): string {
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(notebook.uri) || vscode.workspace.workspaceFolders?.[0];
-    if (!workspaceFolder) throw new Error('Artifacts require an open workspace folder');
-    return path.join(workspaceFolder.uri.fsPath, '.jupyter-mcp', 'artifacts');
+    return workspaceFolder
+      ? path.join(workspaceFolder.uri.fsPath, '.jupyter-mcp', 'artifacts')
+      : path.join(this.context.globalStorageUri.fsPath, 'artifacts');
   }
 
   async getNotebookStatus(uri?: string) {
     const notebook = this.resolveNotebook(uri);
-    const running = this.running(notebook);
+    const key = notebook.uri.toString();
     const kernel = await this.getKernelInfo(notebook.uri);
-    const kernelStatus = running.length > 0 ? 'busy' : kernel?.status ?? 'unknown';
-
-    const kernelBusy = running.length > 0;
+    const entry = this.runtimeEntry(notebook, kernel);
+    const status = kernel?.status ?? 'unknown';
+    if (KERNEL_UNAVAILABLE_STATES.has(status)) {
+      this.activeExecs.delete(key);
+      if (entry) entry.probe = undefined;
+    }
 
     const metaLabel = runtimeLabel(notebook);
     let runtime = metaLabel;
@@ -558,9 +883,12 @@ export class JupyterApi {
     let pythonVersion: string | undefined;
     let pythonPlatform: string | undefined;
 
-    if (!kernelBusy && kernel?.executeCode && kernel.language === 'python') {
-      const probed = await this.probeRuntime(kernel);
-      if (probed) {
+    if (entry && kernel?.executeCode && kernel.language === 'python'
+      && !KERNEL_BUSY_STATES.has(status) && !KERNEL_UNAVAILABLE_STATES.has(status)
+      && !this.batches.has(key) && this.running(notebook).length === 0) {
+      const probe = entry.probe ??= Promise.resolve().then(() => this.probeRuntime(kernel));
+      const probed = await probe;
+      if (probed && this.runtimes.get(key) === entry && entry.probe === probe) {
         pythonVersion = probed.version;
         pythonPlatform = `${probed.platform}/${probed.machine}`;
         runtime = `Python ${probed.version} (${probed.platform}/${probed.machine})`;
@@ -575,6 +903,7 @@ export class JupyterApi {
       runtimeSource = 'notebook-metadata';
     }
 
+    const running = this.running(notebook);
     return {
       path: toPosixPath(notebook.uri.fsPath),
       dirty: notebook.isDirty,
@@ -582,78 +911,38 @@ export class JupyterApi {
       runtime,
       runtimeSource,
       ...(pythonVersion ? { pythonVersion, pythonPlatform } : {}),
-      kernelStatus,
+      kernelStatus: running.length > 0 ? 'busy' : kernel?.status ?? 'unknown',
       kernelLanguage: kernel?.language,
       runningCells: running,
+      recentCompletions: [...(this.completions.get(key) ?? [])],
       ...(running.length > 0
-        ? { hint: 'Kernel is busy. Use jupyter_wait_until_idle before reading outputs.' }
+        ? { hint: 'Cells are running. Use jupyter_get_outputs to read current outputs.' }
         : {}),
     };
   }
 
-  async waitUntilIdle(uri: string | undefined, timeoutSec = 45) {
-    const notebook = this.resolveNotebook(uri);
-    const nbKey = notebook.uri.fsPath;
-    const timeoutMs = Math.max(1, Math.min(timeoutSec, 300)) * 1000;
-    const deadline = Date.now() + timeoutMs;
-    const startAt = Date.now() - 1;
-    let lastKernelCheck = 0;
-    let kernelBusy = false;
-    let lastKnownStatus = 'unknown';
-    let staleChecks = 0;
-    let polling = true;
-    while (polling) {
-      polling = false;
-      const running = this.running(notebook);
-      if (Date.now() - lastKernelCheck >= 1000) {
-        lastKernelCheck = Date.now();
-        const kernel = await this.getKernelInfo(notebook.uri);
-        lastKnownStatus = kernel?.status ?? 'unknown';
-        kernelBusy = !!lastKnownStatus && KERNEL_BUSY_STATES.has(lastKnownStatus);
-      }
-      if (running.length === 0 && !kernelBusy) {
-        await sleep(150);
-        const completed = (this.completions.get(nbKey) ?? []).filter((c) => c.at >= startAt);
-        return {
-          idle: true,
-          waitedMs: Date.now() - startAt,
-          kernelStatus: lastKnownStatus,
-          completed,
-          note: 'Kernel idle. Use jupyter_get_outputs on the cells you care about.',
-        };
-      }
-      if (!kernelBusy && running.length > 0) {
-        staleChecks++;
-        if (staleChecks >= 5) {
-          this.activeExecs.get(nbKey)?.clear();
-          return {
-            idle: true,
-            waitedMs: Date.now() - startAt,
-            kernelStatus: lastKnownStatus,
-            completed: [],
-            clearedStaleTrackers: running,
-            note: 'Kernel is not busy but execution trackers were stuck (likely a dropped kernel connection). Stale entries cleared; verify the affected cells manually and re-run if needed.',
-          };
-        }
-      } else {
-        staleChecks = 0;
-      }
-      if (Date.now() >= deadline) {
-        return {
-          idle: false,
-          waitedMs: Date.now() - startAt,
-          kernelStatus: lastKnownStatus,
-          runningCells: running,
-          retryAfterSec: 5,
-          hint: 'Execution still running. Poll jupyter_wait_until_idle again (short waits beat one long wait — avoids MCP client timeouts), check jupyter_get_status, or use jupyter_interrupt_kernel to abort while preserving variables.',
-        };
-      }
-      await sleep(200);
-      polling = true;
+  private runtimeEntry(notebook: vscode.NotebookDocument, kernel: JupyterKernelLike | undefined): RuntimeEntry | undefined {
+    if (notebook.isClosed) return undefined;
+    const key = notebook.uri.toString();
+    const existing = this.runtimes.get(key);
+    if (existing && existing.kernel === kernel) return existing;
+    existing?.subscription?.dispose();
+    if (!kernel) {
+      this.runtimes.delete(key);
+      return undefined;
     }
+    const entry: RuntimeEntry = { kernel };
+    entry.subscription = kernel.onDidChangeStatus?.((status) => {
+      if (KERNEL_UNAVAILABLE_STATES.has(status)) {
+        entry.probe = undefined;
+        this.activeExecs.delete(key);
+      }
+    });
+    this.runtimes.set(key, entry);
+    return entry;
   }
 
-  private async probeRuntime(kernel: JupyterKernelLike): Promise<{ version: string; platform: string; machine: string } | undefined> {
+  private async probeRuntime(kernel: JupyterKernelLike): Promise<RuntimeInfo | undefined> {
     const line = await this.runKernelProbe(kernel, RUNTIME_PROBE, 'JMCP_RT:', 10000);
     if (!line) return undefined;
     const [version, platform, machine] = line.split('|');
@@ -672,7 +961,7 @@ export class JupyterApi {
         kernelStatus: kernel?.status ?? 'busy',
         count: 0,
         variables: [],
-        hint: 'Kernel is busy — variable probing is deferred until idle. Call jupyter_wait_until_idle first.',
+        hint: 'Kernel is busy — variable probing is deferred until idle. Check jupyter_get_status before retrying.',
       };
     }
 
@@ -776,10 +1065,15 @@ export class JupyterApi {
   }
 
   private async withTimeout<T>(promise: Thenable<T>, ms: number): Promise<T | undefined> {
-    return Promise.race([
-      Promise.resolve(promise).catch(() => undefined as T | undefined),
-      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), ms)),
-    ]);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        Promise.resolve(promise).catch(() => undefined),
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async getPipPackages(uri?: string) {
@@ -939,8 +1233,10 @@ export class JupyterApi {
     const available = new Set(await vscode.commands.getCommands(true));
     for (const [cmd, args] of candidates) {
       if (available.has(cmd)) {
+        const key = notebook.uri.toString();
+        this.batches.get(key)?.abort(new Error('Kernel execution was interrupted.'));
         await vscode.commands.executeCommand(cmd, ...args);
-        this.activeExecs.get(notebook.uri.fsPath)?.clear();
+        this.activeExecs.delete(key);
         return {
           interrupted: true,
           command: cmd,
@@ -960,8 +1256,8 @@ export class JupyterApi {
     const available = new Set(await vscode.commands.getCommands(true));
     for (const [cmd, args] of candidates) {
       if (available.has(cmd)) {
+        this.clearNotebookState(notebook.uri.toString(), 'Kernel was restarted.');
         await vscode.commands.executeCommand(cmd, ...args);
-        this.activeExecs.get(notebook.uri.fsPath)?.clear();
         return {
           restarted: true,
           command: cmd,

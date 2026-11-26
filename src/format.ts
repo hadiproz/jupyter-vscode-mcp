@@ -84,9 +84,8 @@ export function normalizeCellId(cellId: string): string {
   return v;
 }
 
-export function executionText(cell: vscode.NotebookCell): string {
-  const summary = cell.executionSummary;
-  if (!summary?.executionOrder && !summary?.timing) {
+export function executionText(cell: vscode.NotebookCell, summary = cell.executionSummary): string {
+  if (!summary || (!summary.executionOrder && !summary.timing && typeof summary.success !== 'boolean')) {
     return 'not-run';
   }
   const status = summary.success === false ? 'failed' : 'succeeded';
@@ -105,6 +104,10 @@ export function runtimeLabel(notebook: vscode.NotebookDocument): string {
   return kernelName ?? 'unknown';
 }
 
+export function outputMimes(cell: vscode.NotebookCell): string[] {
+  return [...new Set(cell.outputs.flatMap((output) => output.items.map((item) => shortMime(item.mime))))];
+}
+
 export function compactCell(cell: vscode.NotebookCell) {
   return {
     i: cell.index,
@@ -113,7 +116,7 @@ export function compactCell(cell: vscode.NotebookCell) {
     lang: cell.document.languageId,
     lines: cell.document.lineCount,
     exec: executionText(cell),
-    outs: [...new Set(cell.outputs.flatMap((o) => o.items.map((it) => shortMime(it.mime))))],
+    outs: outputMimes(cell),
     first: util.previewText((cell.document.getText().split('\n')[0] ?? '').trim(), 50),
   };
 }

@@ -14,22 +14,22 @@ Point any MCP client at the URL, and the agent can explore, edit, run, and debug
 - IDs are never recycled after a delete: new cells always get fresh random IDs. `jupyter_get_summary` assigns IDs to any cell that lacks one (e.g. hand-created in the UI), so every reported handle is immediately reusable.
 - Indices are **0-based everywhere** (summary, sources, run ranges, outputs) — no mixed conventions.
 
-### Non-blocking execution control
-- `jupyter_run_cells` *starts* execution and returns immediately; poll with `jupyter_wait_until_idle` or snapshot with `jupyter_get_status`. No blind sleeps, no MCP timeouts on long cells.
-- Kernel-readiness guard: running against a dead/absent kernel returns actionable hints instead of wedging.
-- `jupyter_interrupt_kernel` aborts the current run while keeping all variables.
+### Run cells and get outputs in one call
+- `jupyter_run_cells` runs code cells in order, skipping empty, raw, and markdown cells, and stops at the first failure. It waits up to 30 seconds by default and returns each completed cell's outputs, including inline text and artifact paths. Set `includeOutputs: false` for execution results only.
+- Set `waitTimeoutSec` from `0` to `300`. A positive timeout returns `status: "running"` with completed, running, and pending cells. The dispatched cell can finish in the kernel; pending cells remain undispatched. Set `waitTimeoutSec: 0` to start a sequential background batch and return `status: "started"` immediately after dispatching the first cell.
+- Clients using MCP `2026-07-28` can request progress with `_meta.progressToken` and receive SSE notifications, including updates about every five seconds while a cell is running. Timeout or cancellation does not interrupt the kernel. Use `jupyter_interrupt_kernel` to interrupt it while keeping variables.
 
 ### Kernel intelligence (Copilot-grade)
 - `jupyter_get_variables` — type-aware variable reports: DataFrame/Series as `{shape, columns[:8], head(2)}`, ndarray as `{shape, dtype}`, containers with `length`, scalars as short reprs. Uses the official Jupyter variables view API when available, else a silent kernel probe that never touches the execution count. Optional document-symbol filtering hides internal noise only when symbols are actually available.
 - `jupyter_get_pip_packages` — environment inventory (name + version) from the active kernel environment.
 - `jupyter_install_packages` — pip runs **inside the kernel's own interpreter**, so packages land in the runtime the notebook actually uses — remote VMs like Colab included, never the local host. Supports version specs and `--upgrade`, verifies each spec resolves afterwards, and reports honest failures (with pip's real output tail) instead of pretending success.
-- `jupyter_get_status` probes the live kernel for real Python version/platform rather than trusting stale metadata.
+- `jupyter_get_status` reports running cells and recent completions with elapsed times. It caches the live Python version and platform per notebook and kernel, without probing while the kernel is busy.
 - `jupyter_select_kernel` opens VS Code's native kernel picker when no kernel is active.
 
 ### Network-only MCP transport
-- Streamable HTTP (MCP spec 2025-11-25) with plain-JSON responses — a minimal client works with nothing but `curl`.
-- Endpoints: `/mcp` (plus legacy `/sse`), `GET /health` for liveness + version probing.
-- Multiple concurrent agent sessions supported; sessions survive hot port changes.
+- `/mcp` supports both stateless MCP `2026-07-28` and sessionful Streamable HTTP `2025-11-25`. `/` and `/sse` are aliases. `GET /health` reports the version, supported protocol eras, listener instance, and workspace folders.
+- Custom HTTP clients must send `Content-Type: application/json` on MCP POSTs. The server binds to loopback and checks `Host` and `Origin` headers.
+- When another VS Code window takes over the port, the old window closes its sessions. Clients using `2025-11-25` initialize a new session on the same URL.
 
 ### Honest reporting
 Errors carry context and next-step hints: missing kernel → boot guidance, stale ID → refresh via summary, failed pip install → real pip error tail, busy kernel → explicit deferral note instead of silently empty results.
@@ -45,12 +45,11 @@ Errors carry context and next-step hints: missing kernel → boot guidance, stal
 | `jupyter_insert_cell` / `jupyter_delete_cell` | Structure edits at 0-based positions; fresh non-recyclable IDs |
 | `jupyter_save_notebook` | Persist `.ipynb` to disk |
 | `jupyter_create_notebook` | Create empty `.ipynb` on disk + open it in the editor |
-| `jupyter_run_cells` | Non-blocking start: index range `[start,end)` or ordered ID list |
-| `jupyter_wait_until_idle` | Poll until idle or timeout; returns completed cells + success flags |
-| `jupyter_get_status` | Instant snapshot: kernelStatus, live runtime info, running cells, dirty state |
+| `jupyter_run_cells` | Run a range `[start,end)` or ordered ID list; wait for results and outputs or start a background batch |
+| `jupyter_get_status` | Kernel and runtime info, running cells, recent completions, and elapsed times |
 | `jupyter_interrupt_kernel` | Abort current execution, keep variables |
 | `jupyter_restart_kernel` | Full restart (clears variables) |
-| `jupyter_get_outputs` | Outputs inline (short text) or artifact files under `.jupyter-mcp/artifacts/` |
+| `jupyter_get_outputs` | Current outputs with inline short text and artifact paths |
 | `jupyter_get_variables` | Type-aware kernel variable report |
 | `jupyter_get_pip_packages` | Installed package inventory of the kernel environment |
 | `jupyter_install_packages` | Kernel-side pip install with version specs + post-install verification |
@@ -106,7 +105,13 @@ code --install-extension jupyter-vscode-mcp-<version>.vsix
 2. Add the URL config above to your agent.
 3. Probe liveness anytime: `curl http://localhost:9123/health`.
 
-Settings: `jupyter-vscode-mcp.mcpPort` (default 9123, hot-applied), `jupyter-vscode-mcp.autoStart` (default true).
+| Setting | Default | Behavior |
+|---------|---------|----------|
+| `jupyter-vscode-mcp.mcpPort` | `9123` | Loopback port. Changes apply to a running server. |
+| `jupyter-vscode-mcp.autoStart` | `true` | Start the server when VS Code starts. |
+| `jupyter-vscode-mcp.ownershipMode` | `handover` | Take over from a compatible Jupyter MCP window. `fail` reports a conflict without taking over. `hub` is reserved for multi-window routing. |
+
+After handover, the old window shows **Jupyter MCP (yielded)**. To bring that window back, click its status item or run **Jupyter VS Code MCP: Reclaim MCP Port**. If another application owns the configured port, use **Open Settings** in the error message to change it.
 
 ## Recommended Workflow
 
@@ -115,11 +120,13 @@ jupyter_list_open_notebooks   → pick notebook
 jupyter_get_summary           → stable #NB-* IDs, exec state        (0-based)
 jupyter_get_cell_source       → read only what you need
 jupyter_edit_cell             → IDs stay valid after edits
-jupyter_run_cells             → starts async, returns immediately
-jupyter_wait_until_idle       → blocks until done (or poll get_status)
-jupyter_get_outputs           → inline short text, artifact files for big/binary
+jupyter_run_cells             → run cells and get results with outputs
+jupyter_get_status            → follow cells still running after the wait expires
+jupyter_get_outputs           → read current outputs on demand
 jupyter_get_variables         → inspect kernel state after runs
 ```
+
+With a workspace open, artifacts are saved under `.jupyter-mcp/artifacts/`; standalone notebooks use the extension's storage directory.
 
 ## Architecture
 
@@ -130,7 +137,7 @@ AI agent ──HTTP/JSON-RPC──▶ VS Code extension (in-process http server 
                      notebook cells, outputs, kernel status
 ```
 
-Kernel interactions use the documented `ms-toolsai.jupyter` public API (`kernel.executeCode`, interrupt/restart commands, variables/pip listing commands) with command fallbacks; execution tracking relies on `workspace.onDidChangeNotebookDocument`.
+Kernel interactions use the `ms-toolsai.jupyter` public API and native VS Code commands. Execution tracking listens to notebook and kernel events. Window handover uses a per-port control file under `~/.jupyter-vscode-mcp/` to authenticate the loopback request.
 
 ## Development
 
@@ -140,12 +147,13 @@ npm run compile      # typecheck
 npm run lint
 npm run build        # esbuild bundle
 npm run smoke        # local protocol smoke test (vscode stubbed)
+node --test test/unit.test.mjs
 npx @vscode/vsce package
 ```
 
 ## References
 
-- [Model Context Protocol](https://modelcontextprotocol.io) — Streamable HTTP transport, spec 2025-11-25
+- [Model Context Protocol](https://modelcontextprotocol.io) — HTTP transport, specs 2026-07-28 and 2025-11-25
 - [microsoft/vscode-copilot-chat](https://github.com/microsoft/vscode-copilot-chat) (MIT) — variable summarization, truncation budgets, and symbol-filtering patterns
 - [SMARK OpenCode IDE Bridge](https://github.com/SMARK2022/opencode/tree/dev-smark/sdks/vscode) — kernel pre-checks via Jupyter public API, interrupt/restart command fallbacks, event-based completion tracking
 - [kriss-spy/opencode-jupyter](https://github.com/kriss-spy/opencode-jupyter) — original HTTP bridge concept

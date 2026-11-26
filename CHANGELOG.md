@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.0
+
+- **Port handover:** By default, a newly opened VS Code window takes over the MCP port from a compatible window and clears the old window's execution state. Use **Reclaim MCP Port** to switch back, or set `jupyter-vscode-mcp.ownershipMode` to `fail` to keep the current owner.
+- **Execution in one call:** `jupyter_run_cells` waits up to 30 seconds by default, runs cells sequentially, and stops on the first failure. Completed cells include inline outputs and artifact paths. Change the wait with `waitTimeoutSec` or use `0` for a background batch. A wait timeout never interrupts a running cell.
+- **Breaking:** Removed `jupyter_wait_until_idle` (17 tools remain). Use `jupyter_run_cells` for results and `jupyter_get_status` for running cells and recent completions with elapsed times. Status checks cache Python runtime metadata until the kernel changes or the notebook closes.
+- **Dual-era MCP SDK v2:** `/mcp` now serves `2026-07-28` stateless requests, including SSE progress when requested, alongside `2025-11-25` sessionful clients. POST requests require `Content-Type: application/json`; invalid Host or Origin headers return `403`. Unknown tool calls return JSON-RPC `-32602`.
+
 ## 1.0.0 — Initial public release
 
 First public release of **Jupyter VS Code MCP** — an HTTP MCP server that exposes Jupyter notebook operations in VS Code to any MCP-compatible AI agent.

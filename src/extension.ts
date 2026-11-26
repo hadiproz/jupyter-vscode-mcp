@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { PortOwnershipError, type OwnershipMode } from './clusterControl';
 import { JupyterApi } from './jupyterApi';
 import { McpServerManager } from './mcpServer';
 
@@ -6,20 +7,45 @@ let mcpManager: McpServerManager | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
 const CONFIG_SECTION = 'jupyter-vscode-mcp';
 
-function getPort(): number {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>('mcpPort', 9123);
+function getSettings() {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  return {
+    port: config.get<number>('mcpPort', 9123),
+    ownershipMode: config.get<OwnershipMode>('ownershipMode', 'handover'),
+    autoStart: config.get<boolean>('autoStart', true),
+  };
 }
 
-function updateStatus(running: boolean) {
+function updateStatus() {
   if (!statusItem || !mcpManager) return;
-  if (running) {
-    statusItem.text = `$(radio-tower) Jupyter MCP :${getPort()}`;
+  statusItem.command = `${CONFIG_SECTION}.toggleMcp`;
+  if (mcpManager.running) {
+    statusItem.text = `$(radio-tower) Jupyter MCP :${mcpManager.listeningPort}`;
     statusItem.tooltip = 'Jupyter VS Code MCP server is running. Click to stop.';
+    statusItem.backgroundColor = undefined;
+  } else if (mcpManager.yielded) {
+    statusItem.text = '$(circle-slash) Jupyter MCP (yielded)';
+    statusItem.tooltip = 'Another VS Code window took over the MCP port. Click to reclaim it.';
+    statusItem.command = `${CONFIG_SECTION}.reclaimPort`;
     statusItem.backgroundColor = undefined;
   } else {
     statusItem.text = '$(circle-slash) Jupyter MCP off';
     statusItem.tooltip = 'Jupyter VS Code MCP server is stopped. Click to start.';
     statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+  }
+}
+
+function showStartError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof PortOwnershipError || getSettings().ownershipMode === 'hub') {
+    void vscode.window.showErrorMessage(message, 'Open Settings').then((choice) => {
+      if (choice === 'Open Settings') {
+        const setting = error instanceof PortOwnershipError ? 'mcpPort' : 'ownershipMode';
+        return vscode.commands.executeCommand('workbench.action.openSettings', `${CONFIG_SECTION}.${setting}`);
+      }
+    });
+  } else {
+    void vscode.window.showErrorMessage(`Failed to start Jupyter VS Code MCP: ${message}`);
   }
 }
 
@@ -106,65 +132,55 @@ async function showConfig(port: number) {
 export async function activate(context: vscode.ExtensionContext) {
   const jupyterApi = new JupyterApi(context);
   const extVersion = String(context.extension?.packageJSON?.version ?? '0.0.0');
-
-  mcpManager = new McpServerManager(jupyterApi, getPort(), extVersion);
+  const { port, ownershipMode, autoStart } = getSettings();
+  const manager = new McpServerManager(jupyterApi, port, extVersion, {
+    ownershipMode,
+    workspaceFolders: () => (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+    onYield: updateStatus,
+  });
+  mcpManager = manager;
 
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
   context.subscriptions.push(statusItem);
-  updateStatus(false);
+  updateStatus();
+  statusItem.show();
 
-  async function doStart(silent = false): Promise<void> {
+  async function doStart(silent = false, mode?: OwnershipMode): Promise<void> {
     try {
-      await mcpManager?.start();
-      updateStatus(true);
-      if (!silent) vscode.window.showInformationMessage(`Jupyter VS Code MCP started at ${mcpManager?.endpoint}`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      vscode.window.showErrorMessage(`Failed to start Jupyter VS Code MCP: ${msg}`);
-      throw err;
+      await manager.start(mode);
+      if (!silent) void vscode.window.showInformationMessage(`Jupyter VS Code MCP started at ${manager.endpoint}`);
+    } catch (error) {
+      showStartError(error);
+    } finally {
+      updateStatus();
     }
   }
 
-  async function doStop(silent = false): Promise<void> {
-    await mcpManager?.stop();
-    updateStatus(false);
-    if (!silent) vscode.window.showInformationMessage('Jupyter VS Code MCP stopped');
+  async function doStop(): Promise<void> {
+    await manager.stop();
+    updateStatus();
+    void vscode.window.showInformationMessage('Jupyter VS Code MCP stopped');
   }
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('jupyter-vscode-mcp.startMcp', () => doStart()),
-    vscode.commands.registerCommand('jupyter-vscode-mcp.stopMcp', () => doStop()),
-    vscode.commands.registerCommand('jupyter-vscode-mcp.showConfig', () => showConfig(getPort())),
-    vscode.commands.registerCommand('jupyter-vscode-mcp.toggleMcp', async () => {
-      if (mcpManager?.running) {
-        vscode.window.showInformationMessage('Jupyter VS Code MCP stopped');
-        await doStop(true);
-      } else {
-        await doStart();
-      }
+    { dispose: () => jupyterApi.clearAllState() },
+    vscode.commands.registerCommand(`${CONFIG_SECTION}.startMcp`, () => doStart()),
+    vscode.commands.registerCommand(`${CONFIG_SECTION}.stopMcp`, () => doStop()),
+    vscode.commands.registerCommand(`${CONFIG_SECTION}.reclaimPort`, () => doStart(false, 'handover')),
+    vscode.commands.registerCommand(`${CONFIG_SECTION}.showConfig`, () => showConfig(manager.listeningPort)),
+    vscode.commands.registerCommand(`${CONFIG_SECTION}.toggleMcp`, () => manager.running ? doStop() : doStart()),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      jupyterApi.clearStaleWorkspaceState();
+      updateStatus();
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (!e.affectsConfiguration(`${CONFIG_SECTION}.mcpPort`) || !mcpManager) return;
-      const wasRunning = !!mcpManager.running;
-      void (async () => {
-        await mcpManager!.stop();
-        mcpManager = new McpServerManager(jupyterApi, getPort(), extVersion);
-        if (wasRunning) await doStart(true);
-      })();
+      if (!e.affectsConfiguration(`${CONFIG_SECTION}.mcpPort`) && !e.affectsConfiguration(`${CONFIG_SECTION}.ownershipMode`)) return;
+      const settings = getSettings();
+      void manager.configure(settings.port, settings.ownershipMode).catch(showStartError).finally(updateStatus);
     })
   );
 
-  statusItem.command = 'jupyter-vscode-mcp.toggleMcp';
-
-  const autoStart = vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>('autoStart', true);
-  if (autoStart) {
-    try {
-      await mcpManager.start();
-      updateStatus(true);
-    } catch (err) {
-      vscode.window.showErrorMessage(`Jupyter VS Code MCP auto-start failed: ${err}`);
-    }
-  }
+  if (autoStart) await doStart(true);
 }
 
 export async function deactivate() {

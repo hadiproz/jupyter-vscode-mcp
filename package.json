@@ -2,7 +2,7 @@
   "name": "jupyter-vscode-mcp",
   "displayName": "Jupyter VS Code MCP",
   "description": "HTTP MCP server for Jupyter Notebooks in VS Code — portable URL config for Claude Code, Cursor, Windsurf, OpenCode, Kilo, Cline, Copilot and any MCP-compatible AI coding agent",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "icon": "resources/icon.png",
   "publisher": "hadiproz",
   "license": "MIT",
@@ -57,6 +57,11 @@
         "category": "Jupyter VS Code MCP"
       },
       {
+        "command": "jupyter-vscode-mcp.reclaimPort",
+        "title": "Reclaim MCP Port",
+        "category": "Jupyter VS Code MCP"
+      },
+      {
         "command": "jupyter-vscode-mcp.showConfig",
         "title": "Show MCP Configuration",
         "category": "Jupyter VS Code MCP"
@@ -74,6 +79,17 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically start the MCP server when VS Code starts"
+        },
+        "jupyter-vscode-mcp.ownershipMode": {
+          "type": "string",
+          "enum": ["handover", "hub", "fail"],
+          "enumDescriptions": [
+            "Take over the port from another Jupyter VS Code MCP window.",
+            "Reserved for multi-window routing; unavailable in this release.",
+            "Report a port conflict without taking over."
+          ],
+          "default": "handover",
+          "description": "What to do when another process already owns the configured MCP port."
         }
       }
     }
@@ -91,7 +107,10 @@
     "smoke": "node test/local-smoke.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
+    "@modelcontextprotocol/server": "^2.4.0",
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/core": "^2.4.0",
+    "zod": "^4.2.0"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
